@@ -1,18 +1,24 @@
-"""Phase 0 engine: load a model once, generate one request at a time.
+"""Phase 1 engine: load a model once, generate one request at a time, stream tokens.
 
-We write the decode loop by hand (instead of model.generate) for two reasons:
+The decode loop is written by hand (instead of model.generate) for two reasons:
   1. We can time the FIRST token (TTFT) separately from the rest (TPOT).
-  2. Every later phase (streaming, batching, paged KV-cache) is a modification of
-     this exact loop — so it pays to see it in the open.
+  2. Every later phase (batching, paged KV-cache) is a modification of this exact
+     loop — so it pays to see it in the open.
 
-A single global lock serializes generation: the GPU does one request at a time.
-That serialization IS the Phase 0 bottleneck the rest of the project removes.
+Phase 1 change: `stream()` is now the core — a generator that yields each token the
+moment it's sampled. Streaming doesn't make generation faster; it makes it *feel*
+faster: the user sees the first word at TTFT (~100 ms) instead of waiting for the
+whole reply (~3 s). Perceived latency drops ~30x for free.
+
+A single global lock still serializes generation: the GPU does one request at a
+time. That serialization IS the bottleneck Phases 2-3 remove.
 """
 
 from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import torch
@@ -46,7 +52,7 @@ class Engine:
         self.model.eval()
         self.load_seconds = time.perf_counter() - t0
 
-        # Phase 0: one request on the GPU at a time.
+        # Phase 1: one request on the GPU at a time.
         self._lock = threading.Lock()
 
     # -- helpers ----------------------------------------------------------------
@@ -78,13 +84,19 @@ class Engine:
     # -- the loop ---------------------------------------------------------------
 
     @torch.inference_mode()
-    def generate(
+    def stream(
         self,
         prompt: str,
         max_tokens: int = 64,
         temperature: float = 0.7,
         top_p: float = 0.95,
-    ) -> GenResult:
+    ) -> Iterator[dict]:
+        """Yield {"type": "token", "text": ...} per token, then one {"type": "done", ...}.
+
+        Tokens are byte-pair pieces, not words — a single emoji can span two tokens.
+        So we decode the full sequence each step and emit the *delta* text, holding
+        back when the tail is an incomplete UTF-8 sequence (shows up as U+FFFD).
+        """
         with self._lock:  # serialize: one request at a time
             input_ids = self._build_inputs(prompt)
             prompt_len = input_ids.shape[1]
@@ -93,11 +105,12 @@ class Engine:
             start = time.perf_counter()
             ttft = None
             generated: list[int] = []
+            emitted_text = ""
             past = None
             cur = input_ids
             finish_reason = "length"
 
-            for step in range(max_tokens):
+            for _step in range(max_tokens):
                 out = self.model(input_ids=cur, past_key_values=past, use_cache=True)
                 past = out.past_key_values
                 next_id = self._sample(out.logits[0, -1, :], temperature, top_p)
@@ -112,6 +125,13 @@ class Engine:
                     break
 
                 generated.append(next_id)
+                text = self.tokenizer.decode(generated, skip_special_tokens=True)
+                if not text.endswith("�"):  # don't emit half a multibyte char
+                    delta = text[len(emitted_text):]
+                    if delta:
+                        emitted_text = text
+                        yield {"type": "token", "text": delta}
+
                 # After the prefill, we feed back only the single new token; the rest
                 # of the context lives in the KV-cache (`past`). This is the whole
                 # point of the cache — we never re-process the prompt.
@@ -122,16 +142,30 @@ class Engine:
             # TPOT = time spent on tokens after the first, averaged.
             tpot = ((total - ttft) / max(n_out - 1, 1)) if ttft is not None else 0.0
 
-            text = self.tokenizer.decode(generated, skip_special_tokens=True)
-            return GenResult(
-                text=text,
-                prompt_tokens=prompt_len,
-                output_tokens=n_out,
-                ttft_ms=(ttft or 0.0) * 1000,
-                tpot_ms=tpot * 1000,
-                total_ms=total * 1000,
-                finish_reason=finish_reason,
-            )
+            yield {
+                "type": "done",
+                "prompt_tokens": prompt_len,
+                "output_tokens": n_out,
+                "ttft_ms": (ttft or 0.0) * 1000,
+                "tpot_ms": tpot * 1000,
+                "total_ms": total * 1000,
+                "finish_reason": finish_reason,
+            }
+
+    def generate(self, prompt: str, max_tokens: int = 64, temperature: float = 0.7,
+                 top_p: float = 0.95) -> GenResult:
+        """Non-streaming convenience: consume the stream, return the assembled result."""
+        parts: list[str] = []
+        done: dict = {}
+        for ev in self.stream(prompt, max_tokens, temperature, top_p):
+            if ev["type"] == "token":
+                parts.append(ev["text"])
+            else:
+                done = ev
+        return GenResult(text="".join(parts), prompt_tokens=done["prompt_tokens"],
+                         output_tokens=done["output_tokens"], ttft_ms=done["ttft_ms"],
+                         tpot_ms=done["tpot_ms"], total_ms=done["total_ms"],
+                         finish_reason=done["finish_reason"])
 
     def info(self) -> dict:
         gpu = None

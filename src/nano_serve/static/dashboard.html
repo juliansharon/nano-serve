@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>nano-serve dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --text: #e6edf3; --dim: #8b949e; --accent: #58a6ff;
+    --good: #3fb950; --warn: #d29922; --bad: #f85149;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: var(--bg); color: var(--text);
+         font: 14px/1.5 "Segoe UI", system-ui, sans-serif; padding: 20px; }
+  h1 { font-size: 18px; margin-bottom: 2px; }
+  h1 .ver { color: var(--dim); font-weight: normal; font-size: 13px; }
+  #sub { color: var(--dim); font-size: 12px; margin-bottom: 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+          gap: 10px; margin-bottom: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--border);
+          border-radius: 8px; padding: 10px 14px; }
+  .card .label { color: var(--dim); font-size: 11px; text-transform: uppercase;
+                 letter-spacing: .05em; }
+  .card .value { font-size: 26px; font-weight: 600; margin-top: 2px; }
+  .card .unit { font-size: 13px; color: var(--dim); }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+  .panel { background: var(--panel); border: 1px solid var(--border);
+           border-radius: 8px; padding: 12px 14px; }
+  .panel h2 { font-size: 12px; color: var(--dim); text-transform: uppercase;
+              letter-spacing: .05em; margin-bottom: 8px; }
+  canvas { width: 100%; height: 120px; display: block; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { color: var(--dim); text-align: left; font-weight: 500; padding: 4px 8px;
+       border-bottom: 1px solid var(--border); }
+  td { padding: 4px 8px; border-bottom: 1px solid #21262d; white-space: nowrap; }
+  td.prompt { max-width: 260px; overflow: hidden; text-overflow: ellipsis; color: var(--dim); }
+  .pill { padding: 1px 7px; border-radius: 10px; font-size: 11px; }
+  .pill.stop { background: #12261e; color: var(--good); }
+  .pill.length { background: #2b2111; color: var(--warn); }
+  textarea { width: 100%; background: var(--bg); color: var(--text);
+             border: 1px solid var(--border); border-radius: 6px; padding: 8px;
+             font: inherit; resize: vertical; min-height: 54px; }
+  button { background: var(--accent); color: #0d1117; border: 0; border-radius: 6px;
+           padding: 7px 18px; font: 600 13px inherit; cursor: pointer; margin-top: 8px; }
+  button:disabled { opacity: .5; cursor: default; }
+  #out { background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+         padding: 10px; margin-top: 10px; min-height: 70px; white-space: pre-wrap;
+         font-size: 13px; }
+  #playstats { color: var(--dim); font-size: 12px; margin-top: 6px; }
+</style>
+</head>
+<body>
+  <h1>nano-serve <span class="ver">live dashboard — Phase 1</span></h1>
+  <div id="sub">loading…</div>
+
+  <div class="grid">
+    <div class="card"><div class="label">Throughput (10s)</div>
+      <div class="value" id="tput">–</div><span class="unit">tok/s</span></div>
+    <div class="card"><div class="label">In flight</div>
+      <div class="value" id="inflight">–</div><span class="unit">requests</span></div>
+    <div class="card"><div class="label">TTFT p50 / p99</div>
+      <div class="value" id="ttft" style="font-size:20px">–</div><span class="unit">ms</span></div>
+    <div class="card"><div class="label">Latency p50 / p99</div>
+      <div class="value" id="lat" style="font-size:20px">–</div><span class="unit">ms</span></div>
+    <div class="card"><div class="label">Total requests</div>
+      <div class="value" id="total">–</div></div>
+    <div class="card"><div class="label">GPU util / mem</div>
+      <div class="value" id="gpu" style="font-size:20px">–</div></div>
+  </div>
+
+  <div class="row">
+    <div class="panel"><h2>Tokens generated per second (last 60 s)</h2>
+      <canvas id="tputChart" width="600" height="120"></canvas></div>
+    <div class="panel"><h2>GPU utilization % (last 60 s)</h2>
+      <canvas id="gpuChart" width="600" height="120"></canvas></div>
+  </div>
+
+  <div class="row">
+    <div class="panel">
+      <h2>Playground — streams tokens live (SSE)</h2>
+      <textarea id="prompt">Explain continuous batching in two sentences.</textarea>
+      <button id="send">Generate</button>
+      <div id="out"></div>
+      <div id="playstats"></div>
+    </div>
+    <div class="panel">
+      <h2>Recent requests</h2>
+      <div style="max-height:280px;overflow-y:auto">
+      <table>
+        <thead><tr><th>time</th><th>prompt</th><th>tok</th><th>TTFT</th><th>TPOT</th>
+          <th>total</th><th>mode</th><th>end</th></tr></thead>
+        <tbody id="reqs"></tbody>
+      </table>
+      </div>
+    </div>
+  </div>
+
+<script>
+function drawLine(canvas, data, max, color) {
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  ctx.strokeStyle = "#21262d";
+  ctx.beginPath();
+  for (let i = 1; i < 4; i++) { ctx.moveTo(0, h * i / 4); ctx.lineTo(w, h * i / 4); }
+  ctx.stroke();
+  if (!data.length) return;
+  const m = Math.max(max, ...data) * 1.1 || 1;
+  ctx.strokeStyle = color; ctx.lineWidth = 2;
+  ctx.beginPath();
+  data.forEach((v, i) => {
+    const x = i / (data.length - 1) * w, y = h - (v / m) * h;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.stroke();
+  // fill under the line
+  ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
+  ctx.fillStyle = color + "22"; ctx.fill();
+}
+
+async function refresh() {
+  try {
+    const m = await (await fetch("/metrics.json")).json();
+    const e = m.engine || {};
+    document.getElementById("sub").textContent =
+      `${e.model || "?"} on ${e.device || "?"} · uptime ${Math.floor(m.uptime_s)}s · ` +
+      `${m.totals.output_tokens} tokens served`;
+    document.getElementById("tput").textContent = m.throughput_tok_s["10s"].toFixed(1);
+    document.getElementById("inflight").textContent = m.in_flight;
+    document.getElementById("ttft").textContent =
+      `${m.latency.ttft_ms_p50} / ${m.latency.ttft_ms_p99}`;
+    document.getElementById("lat").textContent =
+      `${Math.round(m.latency.total_ms_p50)} / ${Math.round(m.latency.total_ms_p99)}`;
+    document.getElementById("total").textContent = m.totals.requests;
+    document.getElementById("gpu").textContent = m.gpu
+      ? `${m.gpu.util_pct}% · ${(m.gpu.mem_used_mb/1024).toFixed(1)} GB` : "n/a";
+    drawLine(document.getElementById("tputChart"), m.throughput_series_60s, 10, "#58a6ff");
+    drawLine(document.getElementById("gpuChart"),
+             m.gpu_series.map(g => g.util_pct), 100, "#3fb950");
+    document.getElementById("reqs").innerHTML = m.recent_requests.map(r => `
+      <tr><td>${new Date(r.ts*1000).toLocaleTimeString()}</td>
+      <td class="prompt" title="${r.prompt.replace(/"/g,"&quot;")}">${r.prompt}</td>
+      <td>${r.output_tokens}</td><td>${r.ttft_ms} ms</td><td>${r.tpot_ms} ms</td>
+      <td>${Math.round(r.total_ms)} ms</td>
+      <td>${r.stream ? "stream" : "json"}</td>
+      <td><span class="pill ${r.finish_reason}">${r.finish_reason}</span></td></tr>`).join("");
+  } catch (err) {
+    document.getElementById("sub").textContent = "metrics unreachable: " + err;
+  }
+}
+refresh();
+setInterval(refresh, 1000);
+
+// playground: POST with stream:true, parse SSE frames from the fetch body
+document.getElementById("send").onclick = async () => {
+  const btn = document.getElementById("send"), out = document.getElementById("out"),
+        stats = document.getElementById("playstats");
+  btn.disabled = true; out.textContent = ""; stats.textContent = "";
+  const t0 = performance.now(); let tFirst = null;
+  try {
+    const resp = await fetch("/generate", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ prompt: document.getElementById("prompt").value,
+                             max_tokens: 128, stream: true }),
+    });
+    const reader = resp.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const frame = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        if (!frame.startsWith("data:")) continue;
+        const ev = JSON.parse(frame.slice(5));
+        if (ev.done) {
+          stats.textContent = `client TTFT ${tFirst ? (tFirst-t0).toFixed(0) : "?"} ms · ` +
+            `server TTFT ${ev.ttft_ms} ms · TPOT ${ev.tpot_ms} ms · ` +
+            `${ev.output_tokens} tokens in ${(ev.total_ms/1000).toFixed(2)} s`;
+        } else {
+          if (tFirst === null) tFirst = performance.now();
+          out.textContent += ev.text;
+        }
+      }
+    }
+  } catch (err) { out.textContent = "error: " + err; }
+  btn.disabled = false;
+};
+</script>
+</body>
+</html>
