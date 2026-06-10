@@ -1,5 +1,7 @@
 # torch is installed separately with the CUDA wheel index — see README.
-transformers>=4.44
+# transformers is pinned below 4.50: newer releases reference torch.float8_e8m0fnu,
+# a symbol that only exists in torch>=2.7. Our CUDA wheel is torch 2.6.
+transformers>=4.46,<4.50
 accelerate>=0.33
 fastapi>=0.115
 uvicorn[standard]>=0.30

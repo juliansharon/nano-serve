@@ -27,9 +27,21 @@ p99         the slow-tail latency   — worst-case user experience
 | 6 | Observability (Prometheus + Grafana) | prove performance, don't claim it |
 | 7 | Scale-out: replicas + LB + Docker/k8s + CI | distributed & deployable |
 
-## Status: Phase 0 — naive baseline
+## Status: Phase 0 — naive baseline ✅
 
 One request at a time, no batching. This is the number every later phase has to beat.
+
+### Measured baseline (RTX 3050, Qwen2.5-0.5B fp16, 64 max tokens)
+
+| concurrency | throughput | p50 latency | p99 latency |
+|------------:|-----------:|------------:|------------:|
+| 1 | 13.8 tok/s | 3.3 s | 5.8 s |
+| 8 | 21.7 tok/s | **17.2 s** | **21.1 s** |
+
+The lesson of Phase 0 in one table: **8× the load barely moved throughput** (the small
+bump is CPU-side overhead pipelining, not GPU parallelism) **while p99 latency grew 3.6×.**
+The GPU serves one request at a time; everyone else waits behind the lock. Model loads in
+~5 s and uses ~1 GB VRAM, leaving plenty of headroom on the 4 GB card.
 
 ### Hardware
 RTX 3050 Laptop (4 GB). Model: **Qwen2.5-0.5B-Instruct** (fp16, ~1 GB) — small enough
@@ -45,6 +57,8 @@ to iterate fast; the *techniques* are identical at 70B.
 .\.venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu124
 
 # 2. run the server (downloads the model on first start)
+#    HF_HUB_DISABLE_XET=1 avoids a Windows hang in HuggingFace's Xet downloader.
+$env:HF_HOME = "$PWD\.cache"; $env:HF_HUB_DISABLE_XET = "1"
 .\.venv\Scripts\python.exe -m uvicorn nano_serve.server:app --app-dir src --port 8000
 
 # 3. in another shell, benchmark it
