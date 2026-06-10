@@ -1,0 +1,7 @@
+# torch is installed separately with the CUDA wheel index — see README.
+transformers>=4.44
+accelerate>=0.33
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+httpx>=0.27
