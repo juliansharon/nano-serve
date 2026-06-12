@@ -22,7 +22,7 @@ p99         the slow-tail latency   — worst-case user experience
 | **1** | Token streaming (SSE) + live dashboard | perceived latency; observability v0 |
 | **2** | Request queue + scheduler thread | decouple HTTP from the GPU |
 | **3** | ⭐ Continuous (dynamic) batching | the marquee feature — **5.4× measured** |
-| 4 | KV-cache management (paged-attention ideas) | GPU memory as the real bottleneck |
+| **4** | Paged KV-cache + preemption (PagedAttention ideas) | GPU memory as the real bottleneck |
 | 5 | Multi-model routing + auth + rate limiting | a real gateway |
 | 6 | Observability (Prometheus + Grafana) | prove performance, don't claim it |
 | 7 | Scale-out: replicas + LB + Docker/k8s + CI | distributed & deployable |
@@ -108,6 +108,41 @@ stall the running batch (vLLM's answer: chunked prefill); the KV-cache is a dens
 left-padded tensor that re-concatenates as the batch changes (vLLM's answer:
 PagedAttention — that's Phase 4). `NANO_SERVE_MAX_BATCH` tunes the batch ceiling
 (default 8).
+
+## Phase 4 — paged KV-cache + preemption ✅
+
+The KV-cache stops being one padded rectangle and becomes an OS-style paging system
+([block_manager.py](src/nano_serve/block_manager.py) +
+[paged_scheduler.py](src/nano_serve/paged_scheduler.py)):
+
+- All KV memory is **pre-allocated once** as a pool of fixed 16-token blocks
+  (`NANO_SERVE_KV_BLOCKS` × `NANO_SERVE_BLOCK_SIZE`, default 256×16 ≈ 50 MB).
+- A sequence owns a **block table** — an ordered list of block ids. Card `i` lives at
+  `table[i // 16]`, slot `i % 16`. Logical order in the table, physical order anywhere.
+- **Admission/eviction are table edits**, never tensor rebuilds. A freed block is
+  instantly reusable by the next request. The only padding waste is a sequence's own
+  last-block tail (≤15 slots), regardless of what its neighbors look like.
+- **Preemption**: when the pool runs dry mid-step, the youngest sequence is evicted —
+  blocks freed NOW, job re-queued — and later resumed by re-prefilling its prompt
+  **plus its already-generated tokens** (recompute trades compute for memory).
+  Already-streamed text is never re-emitted; clients can't tell it happened.
+
+### Measured
+
+| | result |
+|---|---|
+| throughput @ c=8 | **126.1 tok/s** (dense Phase 3: 116.2 — paged is *faster*: batched gather beats per-step re-concat) |
+| correctness | concurrent prompts isolated; counting test coherent across preemptions |
+| memory stress | 8×96-token jobs on a 384-token pool: **10 preemptions, 8/8 completed, zero OOM** |
+| utilization | dashboard shows paged vs dense-equivalent utilization live (`/metrics.json → kv`) |
+
+First paged version ran at 79 tok/s — the per-step gather looped Python over 24 layers ×
+8 sequences. Stacking the pool as one `[layers, blocks, heads, slot, dim]` tensor made
+each sequence's gather a single indexed read (79 → 126 tok/s, +59%). The remaining
+honest gap to real vLLM: its custom CUDA kernel reads blocks **in place** during
+attention — no gather copy at all. Our bookkeeping is the same; the kernel is the moat.
+
+Run the dense scheduler for A/B comparison: `NANO_SERVE_SCHEDULER=dense`.
 
 ### Hardware
 RTX 3050 Laptop (4 GB). Model: **Qwen2.5-0.5B-Instruct** (fp16, ~1 GB) — small enough

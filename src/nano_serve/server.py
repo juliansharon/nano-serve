@@ -16,6 +16,7 @@ a lock — watch the dashboard's batch-size gauge fill up and throughput climb.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -27,11 +28,12 @@ from starlette.concurrency import iterate_in_threadpool
 
 from nano_serve.engine import DEFAULT_MODEL, Engine
 from nano_serve.metrics import Metrics
+from nano_serve.paged_scheduler import PagedScheduler
 from nano_serve.scheduler import Job, Scheduler
 
-app = FastAPI(title="nano-serve", version="0.3.0")
+app = FastAPI(title="nano-serve", version="0.4.0")
 _engine: Engine | None = None
-_scheduler: Scheduler | None = None
+_scheduler: Scheduler | PagedScheduler | None = None
 _metrics = Metrics()
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -49,7 +51,11 @@ class GenRequest(BaseModel):
 def _load() -> None:
     global _engine, _scheduler
     _engine = Engine(DEFAULT_MODEL)
-    _scheduler = Scheduler(_engine, metrics=_metrics)
+    # Phase 4 paged KV-cache is the default; NANO_SERVE_SCHEDULER=dense gives
+    # the Phase 3 padded-rectangle scheduler for A/B comparison.
+    impl = os.environ.get("NANO_SERVE_SCHEDULER", "paged").lower()
+    cls = Scheduler if impl == "dense" else PagedScheduler
+    _scheduler = cls(_engine, metrics=_metrics)
     _scheduler.start()
     print(f"[nano-serve] ready: {_engine.info()} scheduler={_scheduler.info()}")
 

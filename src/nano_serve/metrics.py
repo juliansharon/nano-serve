@@ -51,6 +51,8 @@ class Metrics:
 
         # scheduler gauges (Phase 3) — updated by the scheduler loop every step
         self._sched = {"queue_depth": 0, "batch_size": 0, "max_batch": 0}
+        # KV pool gauges (Phase 4) — None when running the dense scheduler
+        self._kv: dict | None = None
 
         t = threading.Thread(target=self._gpu_sampler, args=(gpu_poll_seconds,), daemon=True)
         t.start()
@@ -86,6 +88,10 @@ class Metrics:
             self._sched = {"queue_depth": queue_depth, "batch_size": batch_size,
                            "max_batch": max_batch}
 
+    def set_kv(self, kv: dict) -> None:
+        with self._lock:
+            self._kv = kv
+
     # -- GPU sampling -------------------------------------------------------------
 
     def _gpu_sampler(self, interval: float) -> None:
@@ -111,6 +117,7 @@ class Metrics:
             requests = list(self._requests)
             gpu = list(self._gpu)
             sched = dict(self._sched)
+            kv = dict(self._kv) if self._kv else None
             totals = {
                 "requests": self.total_requests,
                 "output_tokens": self.total_output_tokens,
@@ -140,6 +147,7 @@ class Metrics:
             "uptime_s": round(now - self.started_at, 1),
             "in_flight": in_flight,
             "scheduler": sched,
+            "kv": kv,
             "totals": totals,
             "throughput_tok_s": {"10s": round(tput(10), 1), "60s": round(tput(60), 1)},
             "throughput_series_60s": series,
