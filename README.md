@@ -20,8 +20,8 @@ p99         the slow-tail latency   — worst-case user experience
 |-------|--------|---------|
 | **0** | Naive server: 1 request at a time + benchmark | baseline TTFT/TPOT/throughput |
 | **1** | Token streaming (SSE) + live dashboard | perceived latency; observability v0 |
-| 2 | Request queue + background generation loop | decouple HTTP from the GPU |
-| 3 | ⭐ Continuous (dynamic) batching | the marquee feature — 5–10× throughput |
+| **2** | Request queue + scheduler thread | decouple HTTP from the GPU |
+| **3** | ⭐ Continuous (dynamic) batching | the marquee feature — **5.4× measured** |
 | 4 | KV-cache management (paged-attention ideas) | GPU memory as the real bottleneck |
 | 5 | Multi-model routing + auth + rate limiting | a real gateway |
 | 6 | Observability (Prometheus + Grafana) | prove performance, don't claim it |
@@ -71,6 +71,43 @@ The serving concepts it teaches:
 - **percentiles over averages** — p99 is the unluckiest 1%'s experience; averages hide it
 - watch `in_flight` climb while throughput stays flat under load: that's the Phase 0
   bottleneck made visible, and the graph Phase 3 (continuous batching) will fix
+
+## Phases 2+3 — request queue + ⭐ continuous batching ✅
+
+HTTP handlers no longer touch the model. They submit a `Job` to a queue; **one
+scheduler thread owns the GPU** ([scheduler.py](src/nano_serve/scheduler.py)) and at
+every decode step it:
+
+```
+admit:  pull waiting jobs into the batch (prefill, splice KV into the batch cache)
+step:   ONE forward pass advances EVERY active sequence by one token
+reap:   finished sequences leave immediately — their slot is free next step
+```
+
+Why it works: decoding is **memory-bandwidth-bound** — a step reads ~all weights
+whether it advances 1 sequence or 8, so batched tokens are nearly free. Sequences of
+different lengths share the batch via a left-padded KV-cache + attention mask +
+per-row position ids (the same mechanics as HF batched generate, done by hand).
+
+### Measured (RTX 3050, Qwen2.5-0.5B fp16, 64 max tokens, warm, max_batch=8)
+
+| | Phase 0 (lock) | **Phase 3 (cont. batching)** | gain |
+|---|---:|---:|---:|
+| throughput @ c=1 | 13.8–28 tok/s | 24.0 tok/s | ~1× (expected — nothing to batch) |
+| **throughput @ c=8** | 21.7 tok/s | **116.2 tok/s** | **5.4×** |
+| **p50 latency @ c=8** | 17.2 s | **3.2 s** | **5.4× lower** |
+| throughput @ c=16 | — | 139.9 tok/s | still climbing |
+
+**Throughput up 5.4× and latency down 5.4× simultaneously, same GPU.** And combined
+with Phase 1 streaming (`--stream`, c=8): **130 tok/s with client TTFT p50 of 117 ms** —
+8 concurrent users each see their first word in ~a tenth of a second, where Phase 0
+made them stare at a blank screen for 17 s.
+
+Known limits (deliberate, they're the next lessons): prefills run one-at-a-time and
+stall the running batch (vLLM's answer: chunked prefill); the KV-cache is a dense
+left-padded tensor that re-concatenates as the batch changes (vLLM's answer:
+PagedAttention — that's Phase 4). `NANO_SERVE_MAX_BATCH` tunes the batch ceiling
+(default 8).
 
 ### Hardware
 RTX 3050 Laptop (4 GB). Model: **Qwen2.5-0.5B-Instruct** (fp16, ~1 GB) — small enough

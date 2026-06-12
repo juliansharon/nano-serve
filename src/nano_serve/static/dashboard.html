@@ -50,7 +50,7 @@
 </style>
 </head>
 <body>
-  <h1>nano-serve <span class="ver">live dashboard — Phase 1</span></h1>
+  <h1>nano-serve <span class="ver">live dashboard — Phase 3: continuous batching</span></h1>
   <div id="sub">loading…</div>
 
   <div class="grid">
@@ -58,6 +58,8 @@
       <div class="value" id="tput">–</div><span class="unit">tok/s</span></div>
     <div class="card"><div class="label">In flight</div>
       <div class="value" id="inflight">–</div><span class="unit">requests</span></div>
+    <div class="card"><div class="label">Batch / queue</div>
+      <div class="value" id="batch" style="font-size:20px">–</div></div>
     <div class="card"><div class="label">TTFT p50 / p99</div>
       <div class="value" id="ttft" style="font-size:20px">–</div><span class="unit">ms</span></div>
     <div class="card"><div class="label">Latency p50 / p99</div>
@@ -127,6 +129,8 @@ async function refresh() {
       `${m.totals.output_tokens} tokens served`;
     document.getElementById("tput").textContent = m.throughput_tok_s["10s"].toFixed(1);
     document.getElementById("inflight").textContent = m.in_flight;
+    document.getElementById("batch").textContent = m.scheduler
+      ? `${m.scheduler.batch_size}/${m.scheduler.max_batch} · q ${m.scheduler.queue_depth}` : "–";
     document.getElementById("ttft").textContent =
       `${m.latency.ttft_ms_p50} / ${m.latency.ttft_ms_p99}`;
     document.getElementById("lat").textContent =

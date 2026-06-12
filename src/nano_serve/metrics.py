@@ -49,6 +49,9 @@ class Metrics:
         self._requests: deque[dict] = deque(maxlen=200)          # completed requests
         self._gpu: deque[dict] = deque(maxlen=120)               # ~2 min of samples
 
+        # scheduler gauges (Phase 3) — updated by the scheduler loop every step
+        self._sched = {"queue_depth": 0, "batch_size": 0, "max_batch": 0}
+
         t = threading.Thread(target=self._gpu_sampler, args=(gpu_poll_seconds,), daemon=True)
         t.start()
 
@@ -78,6 +81,11 @@ class Metrics:
             self.in_flight -= 1
             self.total_aborted += 1
 
+    def set_scheduler(self, queue_depth: int, batch_size: int, max_batch: int) -> None:
+        with self._lock:
+            self._sched = {"queue_depth": queue_depth, "batch_size": batch_size,
+                           "max_batch": max_batch}
+
     # -- GPU sampling -------------------------------------------------------------
 
     def _gpu_sampler(self, interval: float) -> None:
@@ -102,6 +110,7 @@ class Metrics:
             token_times = list(self._token_times)
             requests = list(self._requests)
             gpu = list(self._gpu)
+            sched = dict(self._sched)
             totals = {
                 "requests": self.total_requests,
                 "output_tokens": self.total_output_tokens,
@@ -130,6 +139,7 @@ class Metrics:
         return {
             "uptime_s": round(now - self.started_at, 1),
             "in_flight": in_flight,
+            "scheduler": sched,
             "totals": totals,
             "throughput_tok_s": {"10s": round(tput(10), 1), "60s": round(tput(60), 1)},
             "throughput_series_60s": series,

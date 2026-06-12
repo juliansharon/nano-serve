@@ -82,6 +82,10 @@ async def run(args: argparse.Namespace) -> None:
             results.append(await fire(client, url, prompt, args.max_tokens))
 
     async with httpx.AsyncClient(timeout=120) as client:
+        # Warm the GPU first — cold kernels and clock ramp-up otherwise skew the
+        # first few requests (we measured 13.8 vs 28 tok/s cold vs warm).
+        for i in range(args.warmup):
+            await one(client, url, PROMPTS[i % len(PROMPTS)], 16)
         wall0 = time.perf_counter()
         await asyncio.gather(*(worker(i) for i in range(args.requests)))
         wall = time.perf_counter() - wall0
@@ -116,4 +120,6 @@ if __name__ == "__main__":
     ap.add_argument("--max-tokens", type=int, default=64)
     ap.add_argument("--stream", action="store_true",
                     help="use SSE streaming and measure client-side TTFT")
+    ap.add_argument("--warmup", type=int, default=3,
+                    help="untimed warmup requests before the benchmark (default 3)")
     asyncio.run(run(ap.parse_args()))

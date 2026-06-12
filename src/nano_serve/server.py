@@ -1,18 +1,16 @@
-"""Phase 1 server: streaming generation + live metrics + dashboard.
+"""Phase 3 server: same API, continuous batching underneath.
 
 Endpoints:
   POST /generate        — JSON in, JSON out; pass {"stream": true} for SSE streaming
   GET  /metrics.json    — live metrics snapshot (the dashboard polls this)
   GET  /dashboard       — human dashboard: charts, request log, live playground
-  GET  /healthz         — liveness + model/device info
+  GET  /healthz         — liveness + model/device/scheduler info
 
-Streaming uses SSE (Server-Sent Events): a plain HTTP response that stays open and
-sends `data: {...}\n\n` frames as tokens arrive — same protocol OpenAI/Anthropic use.
-
-There is still no queue and no batching. FastAPI handles requests concurrently at
-the HTTP layer, but the Engine's lock funnels them through the GPU one at a time;
-fire 8 concurrent requests and 7 sit blocked on the lock. The dashboard now makes
-that visible: in-flight climbs, throughput doesn't. Phases 2-3 fix it.
+The HTTP layer no longer touches the model. A handler submits a Job to the
+Scheduler's queue and consumes token events from the Job's own queue; the
+scheduler thread owns the GPU and batches every active request per decode step.
+Fire 8 concurrent requests now and they share the GPU instead of queueing behind
+a lock — watch the dashboard's batch-size gauge fill up and throughput climb.
 """
 
 from __future__ import annotations
@@ -29,9 +27,11 @@ from starlette.concurrency import iterate_in_threadpool
 
 from nano_serve.engine import DEFAULT_MODEL, Engine
 from nano_serve.metrics import Metrics
+from nano_serve.scheduler import Job, Scheduler
 
-app = FastAPI(title="nano-serve", version="0.1.0")
+app = FastAPI(title="nano-serve", version="0.3.0")
 _engine: Engine | None = None
+_scheduler: Scheduler | None = None
 _metrics = Metrics()
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -47,16 +47,18 @@ class GenRequest(BaseModel):
 
 @app.on_event("startup")
 def _load() -> None:
-    global _engine
+    global _engine, _scheduler
     _engine = Engine(DEFAULT_MODEL)
-    print(f"[nano-serve] ready: {_engine.info()}")
+    _scheduler = Scheduler(_engine, metrics=_metrics)
+    _scheduler.start()
+    print(f"[nano-serve] ready: {_engine.info()} scheduler={_scheduler.info()}")
 
 
 @app.get("/healthz")
 def healthz() -> dict:
-    if _engine is None:
+    if _engine is None or _scheduler is None:
         return {"status": "loading"}
-    return {"status": "ok", **_engine.info()}
+    return {"status": "ok", **_engine.info(), "scheduler": _scheduler.info()}
 
 
 @app.get("/metrics.json")
@@ -84,13 +86,30 @@ def _record(req: GenRequest, done: dict, streamed: bool) -> None:
     })
 
 
+def _job_events(req: GenRequest) -> Iterator[dict]:
+    """Blocking: submit to the scheduler, relay events until done.
+
+    If the consumer disappears (client hung up), the finally-block flags the job
+    cancelled and the scheduler evicts it from the batch at the next step — a
+    freed slot, not a zombie sequence burning GPU.
+    """
+    assert _scheduler is not None
+    job: Job = _scheduler.submit(req.prompt, req.max_tokens, req.temperature, req.top_p)
+    try:
+        while True:
+            ev = job.events.get()
+            yield ev
+            if ev["type"] == "done":
+                break
+    finally:
+        job.cancelled = True  # no-op if already finished
+
+
 def _sse_events(req: GenRequest) -> Iterator[str]:
-    """Blocking generator (runs in a worker thread): engine events -> SSE frames."""
-    assert _engine is not None
     _metrics.request_started()
     finished = False
     try:
-        for ev in _engine.stream(req.prompt, req.max_tokens, req.temperature, req.top_p):
+        for ev in _job_events(req):
             if ev["type"] == "token":
                 _metrics.token_generated()
                 yield f'data: {json.dumps({"text": ev["text"]})}\n\n'
@@ -101,15 +120,13 @@ def _sse_events(req: GenRequest) -> Iterator[str]:
                         for k, v in ev.items() if k != "type"}
                 yield f'data: {json.dumps({"done": True, **done})}\n\n'
     finally:
-        # Client hung up mid-stream: the StreamingResponse closes this generator,
-        # so we still have to balance the in-flight gauge.
         if not finished:
             _metrics.request_aborted()
 
 
 @app.post("/generate")
 async def generate(req: GenRequest):
-    assert _engine is not None, "engine not loaded"
+    assert _scheduler is not None, "scheduler not ready"
     if req.stream:
         return StreamingResponse(
             iterate_in_threadpool(_sse_events(req)),
@@ -117,13 +134,12 @@ async def generate(req: GenRequest):
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    # Non-streaming path consumes the same generator, just assembled server-side.
     def _run() -> tuple[str, dict]:
         _metrics.request_started()
         try:
             parts: list[str] = []
             done: dict = {}
-            for ev in _engine.stream(req.prompt, req.max_tokens, req.temperature, req.top_p):
+            for ev in _job_events(req):
                 if ev["type"] == "token":
                     _metrics.token_generated()
                     parts.append(ev["text"])
